@@ -1,0 +1,418 @@
+name: Application Deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'workload-app/**'
+      - '.github/workflows/app-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      backend_image:
+        description: 'Backend image reference (empty to build, or full reference like registry/repo@sha256:...)'
+        required: false
+        type: string
+      frontend_image:
+        description: 'Frontend image reference (empty to build, or full reference like registry/repo@sha256:...)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 1: Build container images once
+  # ═══════════════════════════════════════════════════════════════════════════
+  build:
+    name: Build Container Images
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.backend_image == '' && github.event.inputs.frontend_image == '' }}
+    environment: test  # Uses test identity for ACR push
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      backend-digest: ${{ steps.build-backend.outputs.digest }}
+      frontend-digest: ${{ steps.build-frontend.outputs.digest }}
+      backend-image: ${{ steps.build-backend.outputs.image }}
+      frontend-image: ${{ steps.build-frontend.outputs.image }}
+      acr-login-server: ${{ steps.get-acr.outputs.loginServer }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure CLI Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get shared ACR details
+        id: get-acr
+        run: |
+          ACR_LOGIN_SERVER=$(az acr list \
+            --resource-group rg-workload-shared \
+            --query '[0].loginServer' \
+            --output tsv)
+          ACR_NAME=$(az acr list \
+            --resource-group rg-workload-shared \
+            --query '[0].name' \
+            --output tsv)
+          
+          echo "loginServer=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+          echo "name=$ACR_NAME" >> $GITHUB_OUTPUT
+          
+          echo "## Shared Container Registry" >> $GITHUB_STEP_SUMMARY
+          echo "- **ACR**: $ACR_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "- **Login Server**: $ACR_LOGIN_SERVER" >> $GITHUB_STEP_SUMMARY
+
+      - name: Build backend container image
+        id: build-backend
+        working-directory: workload-app/backend/HotelBooking.Api
+        run: |
+          ACR_NAME="${{ steps.get-acr.outputs.name }}"
+          IMAGE_TAG="${{ github.sha }}"
+          
+          echo "Building backend image with tag: $IMAGE_TAG"
+          
+          # Build and push image, capture full output
+          BUILD_OUTPUT=$(az acr build \
+            --registry "$ACR_NAME" \
+            --image "hotelbooking-backend:$IMAGE_TAG" \
+            --image "hotelbooking-backend:latest" \
+            --file Dockerfile \
+            . 2>&1)
+          
+          echo "$BUILD_OUTPUT"
+          
+          # Extract digest from build output
+          DIGEST=$(echo "$BUILD_OUTPUT" | grep -oP 'sha256:[a-f0-9]{64}' | head -1)
+          
+          if [ -z "$DIGEST" ]; then
+            echo "Error: Could not extract digest from build output"
+            exit 1
+          fi
+          
+          IMAGE_REF="${{ steps.get-acr.outputs.loginServer }}/hotelbooking-backend@$DIGEST"
+          
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "image=$IMAGE_REF" >> $GITHUB_OUTPUT
+          
+          echo "## Backend Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: $IMAGE_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest**: \`$DIGEST\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reference**: \`$IMAGE_REF\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Build frontend container image
+        id: build-frontend
+        working-directory: workload-app/frontend
+        run: |
+          ACR_NAME="${{ steps.get-acr.outputs.name }}"
+          IMAGE_TAG="${{ github.sha }}"
+          
+          echo "Building frontend image with tag: $IMAGE_TAG"
+          
+          # Build and push image, capture full output
+          BUILD_OUTPUT=$(az acr build \
+            --registry "$ACR_NAME" \
+            --image "hotelbooking-frontend:$IMAGE_TAG" \
+            --image "hotelbooking-frontend:latest" \
+            --file Dockerfile \
+            . 2>&1)
+          
+          echo "$BUILD_OUTPUT"
+          
+          # Extract digest from build output
+          DIGEST=$(echo "$BUILD_OUTPUT" | grep -oP 'sha256:[a-f0-9]{64}' | head -1)
+          
+          if [ -z "$DIGEST" ]; then
+            echo "Error: Could not extract digest from build output"
+            exit 1
+          fi
+          
+          IMAGE_REF="${{ steps.get-acr.outputs.loginServer }}/hotelbooking-frontend@$DIGEST"
+          
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "image=$IMAGE_REF" >> $GITHUB_OUTPUT
+          
+          echo "## Frontend Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: $IMAGE_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest**: \`$DIGEST\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reference**: \`$IMAGE_REF\`" >> $GITHUB_STEP_SUMMARY
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 2: Deploy to test environment
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-test:
+    name: Deploy to Test
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    environment: test
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      frontendFqdn: ${{ steps.workload.outputs.frontendFqdn }}
+      backendFqdn: ${{ steps.workload.outputs.backendFqdn }}
+    steps:
+      - name: Azure CLI Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Determine image references
+        id: images
+        run: |
+          # Use workflow_dispatch inputs if provided, otherwise use build outputs
+          if [ -n "${{ github.event.inputs.backend_image }}" ]; then
+            BACKEND_IMAGE="${{ github.event.inputs.backend_image }}"
+          else
+            BACKEND_IMAGE="${{ needs.build.outputs.backend-image }}"
+          fi
+          
+          if [ -n "${{ github.event.inputs.frontend_image }}" ]; then
+            FRONTEND_IMAGE="${{ github.event.inputs.frontend_image }}"
+          else
+            FRONTEND_IMAGE="${{ needs.build.outputs.frontend-image }}"
+          fi
+          
+          echo "backend=$BACKEND_IMAGE" >> $GITHUB_OUTPUT
+          echo "frontend=$FRONTEND_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Get test workload details
+        id: workload
+        run: |
+          # Get backend container app name
+          BACKEND_APP=$(az containerapp list \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "[?contains(name, 'hotelapi')].name" \
+            --output tsv)
+          
+          # Get frontend container app name
+          FRONTEND_APP=$(az containerapp list \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "[?contains(name, 'hotelspa')].name" \
+            --output tsv)
+          
+          # Get backend container app FQDN
+          BACKEND_FQDN=$(az containerapp show \
+            --name "$BACKEND_APP" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+          
+          # Get frontend container app FQDN
+          FRONTEND_FQDN=$(az containerapp show \
+            --name "$FRONTEND_APP" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+          
+          echo "backendApp=$BACKEND_APP" >> $GITHUB_OUTPUT
+          echo "frontendApp=$FRONTEND_APP" >> $GITHUB_OUTPUT
+          echo "backendFqdn=$BACKEND_FQDN" >> $GITHUB_OUTPUT
+          echo "frontendFqdn=$FRONTEND_FQDN" >> $GITHUB_OUTPUT
+
+      - name: Update backend container app
+        run: |
+          az containerapp update \
+            --name "${{ steps.workload.outputs.backendApp }}" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image "${{ steps.images.outputs.backend }}" \
+            --output none
+          
+          echo "## Test Backend Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **App**: ${{ steps.workload.outputs.backendApp }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ steps.images.outputs.backend }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **FQDN**: https://${{ steps.workload.outputs.backendFqdn }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update frontend container app
+        run: |
+          # Set backend URL environment variable
+          BACKEND_URL="https://${{ steps.workload.outputs.backendFqdn }}"
+          
+          az containerapp update \
+            --name "${{ steps.workload.outputs.frontendApp }}" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image "${{ steps.images.outputs.frontend }}" \
+            --set-env-vars "BACKEND_URL=$BACKEND_URL" \
+            --output none
+          
+          echo "## Test Frontend Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **App**: ${{ steps.workload.outputs.frontendApp }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ steps.images.outputs.frontend }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **FQDN**: https://${{ steps.workload.outputs.frontendFqdn }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend URL**: $BACKEND_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Wait for revisions to be ready
+        run: |
+          echo "Waiting for backend revision to be ready..."
+          az containerapp revision list \
+            --name "${{ steps.workload.outputs.backendApp }}" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "[?properties.active].{Name:name, TrafficWeight:properties.trafficWeight, RunningState:properties.runningState}" \
+            --output table
+          
+          echo "Waiting for frontend revision to be ready..."
+          az containerapp revision list \
+            --name "${{ steps.workload.outputs.frontendApp }}" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "[?properties.active].{Name:name, TrafficWeight:properties.trafficWeight, RunningState:properties.runningState}" \
+            --output table
+          
+          # Give revisions time to stabilize
+          sleep 30
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 3: Smoke test the test environment
+  # ═══════════════════════════════════════════════════════════════════════════
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy-test
+    steps:
+      - name: Test frontend is reachable
+        run: |
+          FRONTEND_URL="${{ needs.deploy-test.outputs.frontendFqdn }}"
+          
+          echo "Testing frontend at: https://$FRONTEND_URL"
+          
+          HTTP_STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            --max-time 30 \
+            "https://$FRONTEND_URL")
+          
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "✓ Frontend is reachable (HTTP $HTTP_STATUS)"
+            echo "## Smoke Test: PASSED" >> $GITHUB_STEP_SUMMARY
+            echo "- **Frontend**: https://$FRONTEND_URL → HTTP $HTTP_STATUS ✓" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✗ Frontend returned unexpected status: HTTP $HTTP_STATUS"
+            echo "## Smoke Test: FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "- **Frontend**: https://$FRONTEND_URL → HTTP $HTTP_STATUS ✗" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Stage 4: Deploy to production (requires approval)
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, smoke-test]
+    if: ${{ always() && needs.smoke-test.result == 'success' }}
+    environment: prod  # This environment requires manual approval
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Azure CLI Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Determine image references
+        id: images
+        run: |
+          # Use workflow_dispatch inputs if provided, otherwise use build outputs
+          if [ -n "${{ github.event.inputs.backend_image }}" ]; then
+            BACKEND_IMAGE="${{ github.event.inputs.backend_image }}"
+          else
+            BACKEND_IMAGE="${{ needs.build.outputs.backend-image }}"
+          fi
+          
+          if [ -n "${{ github.event.inputs.frontend_image }}" ]; then
+            FRONTEND_IMAGE="${{ github.event.inputs.frontend_image }}"
+          else
+            FRONTEND_IMAGE="${{ needs.build.outputs.frontend-image }}"
+          fi
+          
+          echo "backend=$BACKEND_IMAGE" >> $GITHUB_OUTPUT
+          echo "frontend=$FRONTEND_IMAGE" >> $GITHUB_OUTPUT
+          
+          echo "## Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "Deploying the same images that passed test:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend**: \`$BACKEND_IMAGE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Frontend**: \`$FRONTEND_IMAGE\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Get prod workload details
+        id: workload
+        run: |
+          # Get backend container app name
+          BACKEND_APP=$(az containerapp list \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "[?contains(name, 'hotelapi')].name" \
+            --output tsv)
+          
+          # Get frontend container app name
+          FRONTEND_APP=$(az containerapp list \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "[?contains(name, 'hotelspa')].name" \
+            --output tsv)
+          
+          # Get backend container app FQDN
+          BACKEND_FQDN=$(az containerapp show \
+            --name "$BACKEND_APP" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+          
+          # Get frontend container app FQDN
+          FRONTEND_FQDN=$(az containerapp show \
+            --name "$FRONTEND_APP" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+          
+          echo "backendApp=$BACKEND_APP" >> $GITHUB_OUTPUT
+          echo "frontendApp=$FRONTEND_APP" >> $GITHUB_OUTPUT
+          echo "backendFqdn=$BACKEND_FQDN" >> $GITHUB_OUTPUT
+          echo "frontendFqdn=$FRONTEND_FQDN" >> $GITHUB_OUTPUT
+
+      - name: Update backend container app
+        run: |
+          az containerapp update \
+            --name "${{ steps.workload.outputs.backendApp }}" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image "${{ steps.images.outputs.backend }}" \
+            --output none
+          
+          echo "## Production Backend Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **App**: ${{ steps.workload.outputs.backendApp }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ steps.images.outputs.backend }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **FQDN**: https://${{ steps.workload.outputs.backendFqdn }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update frontend container app
+        run: |
+          # Set backend URL environment variable
+          BACKEND_URL="https://${{ steps.workload.outputs.backendFqdn }}"
+          
+          az containerapp update \
+            --name "${{ steps.workload.outputs.frontendApp }}" \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image "${{ steps.images.outputs.frontend }}" \
+            --set-env-vars "BACKEND_URL=$BACKEND_URL" \
+            --output none
+          
+          echo "## Production Frontend Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **App**: ${{ steps.workload.outputs.frontendApp }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ steps.images.outputs.frontend }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **FQDN**: https://${{ steps.workload.outputs.frontendFqdn }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend URL**: $BACKEND_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Verify deployment
+        run: |
+          echo "## Deployment Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Production is now running the same container images that passed test:" >> $GITHUB_STEP_SUMMARY
+          echo "- Same registry: \`${{ needs.build.outputs.acr-login-server }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Same backend digest: \`${{ needs.build.outputs.backend-digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Same frontend digest: \`${{ needs.build.outputs.frontend-digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Build-once, promote-everywhere contract maintained.** ✓" >> $GITHUB_STEP_SUMMARY

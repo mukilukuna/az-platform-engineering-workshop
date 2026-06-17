@@ -55,6 +55,12 @@ param hubVnetId string
 @description('Resource ID of the Container Apps subnet (must be delegated to Microsoft.App/environments, /23 or larger).')
 param containerAppsSubnetId string
 
+@description('Resource ID of the shared Azure Container Registry.')
+param acrResourceId string
+
+@description('Login server of the shared Azure Container Registry.')
+param acrLoginServer string
+
 @description('SQL Database SKU (Basic, S0, S1, etc.).')
 param sqlDatabaseSku string = 'Basic'
 
@@ -104,7 +110,6 @@ param tags object = {
 // ============================================================================
 
 var resourceToken = '${workloadName}-${environmentName}-${regionShortName}'
-var acrName = 'cr${regionShortName}${environmentName}001'  // Environment-specific: crswedencentraltest001, crswedencentralprod001
 // Generate unique suffix for globally unique resources (SQL Server)
 var uniqueSuffix = uniqueString(subscription().subscriptionId, resourceGroup().id)
 var sqlServerName = 'sql-${resourceToken}-${uniqueSuffix}'
@@ -181,35 +186,26 @@ module appInsights 'br/public:avm/res/insights/component:0.4.2' = {
 }
 
 // ============================================================================
-// Azure Container Registry (Public — workshop requirement, per-environment)
+// RBAC — Grant AcrPull to runtime identities on shared ACR
 // ============================================================================
 
-module containerRegistry 'br/public:avm/res/container-registry/registry:0.9.0' = {
-  name: 'acr-deployment'
+module backendAcrPullAssignment 'modules/acr-role-assignment.bicep' = {
+  name: 'backend-acr-pull-assignment'
+  scope: resourceGroup(split(acrResourceId, '/')[2], split(acrResourceId, '/')[4])  // Shared ACR's subscription and RG
   params: {
-    name: acrName
-    location: location
-    tags: tags
-    acrSku: 'Basic'
-    // Admin user DISABLED (managed identity pull only)
-    acrAdminUserEnabled: false
-    // Public network access ENABLED (workshop requirement)
-    // "Allow All Networks" — no ipRules, no virtualNetworkRules, no service-endpoint-only access
-    publicNetworkAccess: 'Enabled'
-    // Do NOT add networkRuleSet / networkAcls / ipRules — workshop requires unrestricted public access
-    // Grant AcrPull to runtime identities (done via roleAssignments)
-    roleAssignments: [
-      {
-        principalId: backendIdentity.outputs.principalId
-        roleDefinitionIdOrName: 'AcrPull'
-        principalType: 'ServicePrincipal'
-      }
-      {
-        principalId: frontendIdentity.outputs.principalId
-        roleDefinitionIdOrName: 'AcrPull'
-        principalType: 'ServicePrincipal'
-      }
-    ]
+    acrResourceId: acrResourceId
+    principalId: backendIdentity.outputs.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+module frontendAcrPullAssignment 'modules/acr-role-assignment.bicep' = {
+  name: 'frontend-acr-pull-assignment'
+  scope: resourceGroup(split(acrResourceId, '/')[2], split(acrResourceId, '/')[4])  // Shared ACR's subscription and RG
+  params: {
+    acrResourceId: acrResourceId
+    principalId: frontendIdentity.outputs.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -409,7 +405,7 @@ module backendContainerApp 'br/public:avm/res/app/container-app:0.12.0' = {
     // ACR pull with managed identity
     registries: [
       {
-        server: containerRegistry.outputs.loginServer
+        server: acrLoginServer
         identity: backendIdentity.outputs.resourceId
       }
     ]
@@ -479,7 +475,7 @@ module frontendContainerApp 'br/public:avm/res/app/container-app:0.12.0' = {
     // ACR pull with managed identity
     registries: [
       {
-        server: containerRegistry.outputs.loginServer
+        server: acrLoginServer
         identity: frontendIdentity.outputs.resourceId
       }
     ]
@@ -529,11 +525,11 @@ output appInsightsResourceId string = appInsights.outputs.resourceId
 @description('Application Insights connection string')
 output appInsightsConnectionString string = appInsights.outputs.connectionString
 
-@description('Container Registry name')
-output containerRegistryName string = containerRegistry.outputs.name
+@description('Container Registry name (from shared ACR)')
+output containerRegistryName string = split(acrResourceId, '/')[8]
 
-@description('Container Registry login server')
-output containerRegistryLoginServer string = containerRegistry.outputs.loginServer
+@description('Container Registry login server (from shared ACR)')
+output containerRegistryLoginServer string = acrLoginServer
 
 @description('SQL Server name')
 output sqlServerName string = sqlServer.outputs.name
