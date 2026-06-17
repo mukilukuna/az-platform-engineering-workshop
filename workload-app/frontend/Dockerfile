@@ -4,9 +4,9 @@
 FROM mcr.microsoft.com/azurelinux/base/nodejs:24 AS build
 WORKDIR /app
 
-# Copy package files and install dependencies (cached layer)
+# Copy package files and install ALL dependencies (build needs devDependencies)
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm install
 
 # Copy source and build with Vite
 COPY . ./
