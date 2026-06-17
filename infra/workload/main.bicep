@@ -103,6 +103,7 @@ param tags object = {
   workload: workloadName
   environment: environmentName
   managedBy: 'bicep'
+  owner: 'platform-team'
 }
 
 // ============================================================================
